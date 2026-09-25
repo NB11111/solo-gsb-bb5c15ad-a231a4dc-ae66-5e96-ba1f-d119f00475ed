@@ -18,6 +18,7 @@ from app.core import (
     STATUS_CONFLICT,
     STATUS_NO_SOLUTION,
     STATUS_OK,
+    reconcile_meter_change,
     reconcile_total,
     solve_daily_segment,
     solve_segment,
@@ -25,11 +26,13 @@ from app.core import (
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
         "整条序列的回绕次数总和，仅确定圈数已唯一的分段用量；"
+        "支持换表账单复核：旧表终读与新表初读同刻、两表模数可不同，"
+        "联立两段用量之和与跨表账单总量；"
         "还支持按 UTC 自然日给出覆盖时段内每日最小/最大可行整数用量。"
     ),
 )
@@ -98,6 +101,51 @@ class ReconcileRequest(_BaseUsageRequest):
 
 class DailyRangeRequest(_BaseUsageRequest):
     """按 UTC 自然日的每日用量上下界请求（读数/模数/速率校验与其他接口一致）。"""
+
+
+class MeterSpan(BaseModel):
+    """单只表的起止读数及该表参数（读数时间/取值校验与 Reading 一致）。"""
+
+    modulus: int = Field(ge=1, description="该表计数器模数（回绕周期）")
+    max_rate_per_second: Decimal = Field(
+        ge=0, description="该表每秒最大计数增量，支持小数（按精确分数计算）"
+    )
+    start: Reading = Field(description="该表起始读数")
+    end: Reading = Field(description="该表终止读数")
+
+    @model_validator(mode="after")
+    def _check_span(self) -> "MeterSpan":
+        for r in (self.start, self.end):
+            if r.value >= self.modulus:
+                raise ValueError(
+                    f"读数 {r.value} 超出模数范围 [0, {self.modulus})"
+                )
+        if self.end.timestamp <= self.start.timestamp:
+            raise ValueError(
+                "起止时间戳必须严格递增："
+                f"{self.start.timestamp.isoformat()} 之后出现 {self.end.timestamp.isoformat()}"
+            )
+        return self
+
+
+class MeterChangeReconcileRequest(BaseModel):
+    """换表账单复核请求：旧表、新表各一段起止读数，账单总量跨两表。"""
+
+    old_meter: MeterSpan = Field(description="旧表起止读数与参数")
+    new_meter: MeterSpan = Field(description="新表起止读数与参数")
+    total_usage: int = Field(
+        ge=0, description="跨两表的账单总用量（非负整数）"
+    )
+
+    @model_validator(mode="after")
+    def _check_switch_instant(self) -> "MeterChangeReconcileRequest":
+        if self.old_meter.end.timestamp != self.new_meter.start.timestamp:
+            raise ValueError(
+                "旧表终读与新表初读必须为同一时刻（换表时刻）："
+                f"{self.old_meter.end.timestamp.isoformat()} != "
+                f"{self.new_meter.start.timestamp.isoformat()}"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +315,76 @@ class DailyRangeResponse(BaseModel):
     conflicts: List[DailyRangeConflictOut] = Field(
         description="不存在可行子段分配的读数区间及冲突原因；非空时 days 为空"
     )
+
+
+# ---------------------------------------------------------------------------
+# 换表账单复核接口响应模型
+# ---------------------------------------------------------------------------
+
+class MeterChangeSegmentOut(BaseModel):
+    meter: Literal["old", "new"] = Field(description="该段属于旧表还是新表")
+    modulus: int = Field(description="该表计数器模数")
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int
+    min_wraps: int = Field(description="账单总量约束后仍可行的最小回绕次数")
+    max_wraps: int = Field(description="账单总量约束后仍可行的最大回绕次数")
+    wraps: Optional[int] = Field(
+        default=None, description="圈数唯一时的回绕次数；仍有多解时为 null"
+    )
+    usage: Optional[int] = Field(
+        default=None, description="圈数唯一时该段的确定用量；仍有多解时为 null"
+    )
+    min_usage: Optional[int] = Field(
+        default=None, description="仍有多解时该段用量的下界；圈数唯一时为 null"
+    )
+    max_usage: Optional[int] = Field(
+        default=None, description="仍有多解时该段用量的上界；圈数唯一时为 null"
+    )
+
+
+class MeterChangeSegmentErrorOut(BaseModel):
+    kind: Literal["segment"] = Field(description="冲突层级：分段")
+    meter: Literal["old", "new"] = Field(description="无解段属于旧表还是新表")
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int
+    reason: Literal["no_solution"]
+    detail: str
+    min_wraps: int
+    max_wraps: int
+
+
+class MeterChangeTotalErrorOut(BaseModel):
+    kind: Literal["total"] = Field(description="冲突层级：账单总量")
+    reason: Literal[
+        "total_incompatible_modulus", "total_out_of_range"
+    ]
+    detail: str
+    modulus_gcd: int = Field(description="两表模数的最大公约数 g")
+    feasible_min_total: int = Field(description="可行账单总量的下界（含）")
+    feasible_max_total: int = Field(description="可行账单总量的上界（含）")
+    expected_remainder: Optional[int] = Field(
+        default=None, description="与两表模数相容时账单总量应有的模 g 余数"
+    )
+
+
+class MeterChangeReconcileResponse(BaseModel):
+    status: Literal["ok", "conflict"]
+    total_usage: int = Field(description="请求给出的跨表账单总用量")
+    modulus_gcd: Optional[int] = Field(
+        default=None, description="两表模数的最大公约数 g；分段冲突时为 null"
+    )
+    segments: List[MeterChangeSegmentOut] = Field(
+        description="账单总量约束后的两段结果（旧表在前）：圈数唯一者给出确定用量，其余给出范围"
+    )
+    conflicts: List[
+        Union[MeterChangeSegmentErrorOut, MeterChangeTotalErrorOut]
+    ] = Field(description="冲突明细：某段原本无解，或账单总量与两表模数不相容/超界")
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +587,144 @@ def reconcile_usage(req: ReconcileRequest) -> ReconcileResponse:
         modulus=req.modulus,
         total_usage=req.total_usage,
         total_wraps=result.total_wraps,
+        segments=segments,
+        conflicts=[],
+    )
+
+
+@app.post(
+    "/v1/usage/meter-change/reconcile", response_model=MeterChangeReconcileResponse
+)
+def reconcile_meter_change_usage(
+    req: MeterChangeReconcileRequest,
+) -> MeterChangeReconcileResponse:
+    """换表账单复核：旧表终读与新表初读同刻，联立两段用量与跨表账单总量。
+
+    两表模数、最大速率可不同；先分别求各段满足非负增量与速率上限的
+    回绕区间，再以扩展欧几里得闭式联立 ``k1*M1 + k2*M2 = B - Σ读数差``，
+    不枚举圈数组合。圈数唯一时两段用量同时确定，否则各给上下界。
+    """
+    meters = (("old", req.old_meter), ("new", req.new_meter))
+
+    # 1) 分别判定各段：某段原本无解即构成分段冲突，不进行总量推断
+    segment_conflicts: List[MeterChangeSegmentErrorOut] = []
+    feasible = []
+    for label, span in meters:
+        elapsed = int((span.end.timestamp - span.start.timestamp).total_seconds())
+        sol = solve_segment(
+            len(feasible) + len(segment_conflicts),
+            span.start.value,
+            span.end.value,
+            elapsed,
+            span.modulus,
+            Fraction(span.max_rate_per_second),
+        )
+        if sol.status == STATUS_NO_SOLUTION:
+            segment_conflicts.append(
+                MeterChangeSegmentErrorOut(
+                    kind="segment",
+                    meter=label,  # type: ignore[arg-type]
+                    start_timestamp=span.start.timestamp,
+                    end_timestamp=span.end.timestamp,
+                    start_reading=span.start.value,
+                    end_reading=span.end.value,
+                    elapsed_seconds=elapsed,
+                    reason=STATUS_NO_SOLUTION,
+                    detail=_no_solution_detail(
+                        span.end.value - span.start.value, span.modulus, sol, elapsed
+                    ),
+                    min_wraps=sol.min_wraps,
+                    max_wraps=sol.max_wraps,
+                )
+            )
+        else:
+            feasible.append((label, span, elapsed, sol))
+
+    if segment_conflicts:
+        return MeterChangeReconcileResponse(
+            status=STATUS_CONFLICT,
+            total_usage=req.total_usage,
+            modulus_gcd=None,
+            segments=[],
+            conflicts=segment_conflicts,
+        )
+
+    # 2) 两段均本身可行：模数可不同，闭式联立两段用量之和与账单总量
+    diffs = tuple(span.end.value - span.start.value for _, span, _, _ in feasible)
+    bounds = tuple((sol.min_wraps, sol.max_wraps) for *_, sol in feasible)
+    moduli = tuple(span.modulus for _, span, _, _ in feasible)
+    result = reconcile_meter_change(diffs, bounds, moduli, req.total_usage)  # type: ignore[arg-type]
+
+    if result.status == STATUS_CONFLICT:
+        base = sum(diffs)
+        expected_remainder = base % result.modulus_gcd
+        total_conflicts = []
+        for reason in result.conflicts:
+            if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS:
+                detail = (
+                    f"账单总量与两表模数不相容：总量 B 必须满足 "
+                    f"B ≡ {expected_remainder} (mod {result.modulus_gcd})"
+                    f"（g = gcd({moduli[0]}, {moduli[1]})，两段读数差之和为 {base}），"
+                    f"收到 {req.total_usage}（余数 {req.total_usage % result.modulus_gcd}），"
+                    f"不定方程 k1×{moduli[0]} + k2×{moduli[1]} = B - {base} 无整数解"
+                )
+            else:  # REASON_TOTAL_OUT_OF_RANGE
+                detail = (
+                    f"账单总量超出可行范围：两段回绕次数均为非负整数且满足各自"
+                    f"速率上限时，总用量只能在 [{result.feasible_min_total}, "
+                    f"{result.feasible_max_total}]（模数 {moduli[0]}、{moduli[1]}，"
+                    f"且需满足模 {result.modulus_gcd} 同余）之内，"
+                    f"收到 {req.total_usage}"
+                )
+            total_conflicts.append(
+                MeterChangeTotalErrorOut(
+                    kind="total",
+                    reason=reason,  # type: ignore[arg-type]
+                    detail=detail,
+                    modulus_gcd=result.modulus_gcd,
+                    feasible_min_total=result.feasible_min_total,
+                    feasible_max_total=result.feasible_max_total,
+                    expected_remainder=(
+                        expected_remainder
+                        if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS
+                        else None
+                    ),
+                )
+            )
+        return MeterChangeReconcileResponse(
+            status=STATUS_CONFLICT,
+            total_usage=req.total_usage,
+            modulus_gcd=result.modulus_gcd,
+            segments=[],
+            conflicts=total_conflicts,
+        )
+
+    # 3) 可行：圈数唯一（两段必然同时唯一）时确定用量，否则仅给范围，不猜测
+    segments: List[MeterChangeSegmentOut] = []
+    for (label, span, elapsed, _), ns in zip(feasible, result.narrowed):
+        min_usage, max_usage = ns.usage_bounds(span.modulus)
+        segments.append(
+            MeterChangeSegmentOut(
+                meter=label,  # type: ignore[arg-type]
+                modulus=span.modulus,
+                start_timestamp=span.start.timestamp,
+                end_timestamp=span.end.timestamp,
+                start_reading=span.start.value,
+                end_reading=span.end.value,
+                elapsed_seconds=elapsed,
+                min_wraps=ns.min_wraps,
+                max_wraps=ns.max_wraps,
+                wraps=ns.wraps,
+                usage=ns.usage(span.modulus),
+                min_usage=None if ns.unique else min_usage,
+                max_usage=None if ns.unique else max_usage,
+            )
+        )
+
+    return MeterChangeReconcileResponse(
+        status=STATUS_OK,
+        total_usage=req.total_usage,
+        modulus_gcd=result.modulus_gcd,
         segments=segments,
         conflicts=[],
     )

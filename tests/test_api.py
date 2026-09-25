@@ -8,7 +8,7 @@ from fractions import Fraction
 
 from fastapi.testclient import TestClient
 
-from app.core import solve_daily_segment
+from app.core import reconcile_meter_change, solve_daily_segment, solve_segment
 from app.main import app
 
 client = TestClient(app)
@@ -24,6 +24,10 @@ def _reconcile(payload):
 
 def _daily_range(payload):
     return _post(payload, path="/v1/usage/daily-range")
+
+
+def _meter_change(payload):
+    return _post(payload, path="/v1/usage/meter-change/reconcile")
 
 
 # ---------------------------------------------------------------------------
@@ -858,3 +862,421 @@ def test_daily_segment_bounds_exact_by_brute_force():
             assert list(result.min_usages) == lows
             assert list(result.max_usages) == highs
     assert checked > 200  # 确认确实跑了足够多的用例
+
+
+# ---------------------------------------------------------------------------
+# 换表账单复核 /v1/usage/meter-change/reconcile
+# ---------------------------------------------------------------------------
+
+_T0 = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+
+def _z(seconds: int) -> str:
+    return (_T0 + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_meter_change_unique_different_moduli():
+    """两表模数不同且各段圈数唯一：账单下两段用量同时确定。"""
+    resp = _meter_change(
+        {
+            "old_meter": {
+                # 900 -> 100 一次回绕，10s 上限 200，k1 唯一为 1，用量 200
+                "modulus": 1000,
+                "max_rate_per_second": 20,
+                "start": {"timestamp": _z(0), "value": 900},
+                "end": {"timestamp": _z(10), "value": 100},
+            },
+            "new_meter": {
+                # 250 -> 50 一次回绕（M=300），10s 上限 100，k2 唯一为 1，用量 100
+                "modulus": 300,
+                "max_rate_per_second": 10,
+                "start": {"timestamp": _z(10), "value": 250},
+                "end": {"timestamp": _z(20), "value": 50},
+            },
+            "total_usage": 300,  # 1×1000 + 1×300 + (-800) + (-200) = 300
+        }
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["modulus_gcd"] == 100
+    assert body["conflicts"] == []
+    old, new = body["segments"]
+    assert old["meter"] == "old" and old["modulus"] == 1000
+    assert (old["min_wraps"], old["max_wraps"]) == (1, 1)
+    assert old["wraps"] == 1 and old["usage"] == 200
+    assert old["min_usage"] is None and old["max_usage"] is None
+    assert new["meter"] == "new" and new["modulus"] == 300
+    assert new["wraps"] == 1 and new["usage"] == 100
+    assert old["usage"] + new["usage"] == 300
+
+
+def test_meter_change_ranges_without_guessing():
+    """圈数多解：两段各给用量上下界，且一段上界与另一段下界互补为账单总量。"""
+    resp = _meter_change(
+        {
+            "old_meter": {
+                # 100 -> 200，10000s 上限 100000：k1 ∈ [0, 99]
+                "modulus": 1000,
+                "max_rate_per_second": 10,
+                "start": {"timestamp": _z(0), "value": 100},
+                "end": {"timestamp": _z(10000), "value": 200},
+            },
+            "new_meter": {
+                # 10 -> 20（M=300），同速率同时长：k2 ∈ [0, 333]
+                "modulus": 300,
+                "max_rate_per_second": 10,
+                "start": {"timestamp": _z(10000), "value": 10},
+                "end": {"timestamp": _z(20000), "value": 20},
+            },
+            # k1*1000 + k2*300 = 10000 -> (k1,k2) ∈ {(1,30),(4,20),(7,10),(10,0)}
+            "total_usage": 10110,
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    old, new = body["segments"]
+    assert (old["min_wraps"], old["max_wraps"]) == (1, 10)
+    assert old["wraps"] is None and old["usage"] is None
+    assert (old["min_usage"], old["max_usage"]) == (1100, 10100)
+    assert (new["min_wraps"], new["max_wraps"]) == (0, 30)
+    assert (new["min_usage"], new["max_usage"]) == (10, 9010)
+    # 上下界互补：任何可行组合下两段用量之和恒为账单总量
+    assert old["min_usage"] + new["max_usage"] == 10110
+    assert old["max_usage"] + new["min_usage"] == 10110
+
+
+def test_meter_change_same_modulus_matches_reconcile():
+    """模数相同（g=M）时，两段结果与既有总量对账接口完全一致。"""
+    payload = {
+        "old_meter": {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "start": {"timestamp": _z(0), "value": 100},
+            "end": {"timestamp": _z(1000), "value": 200},
+        },
+        "new_meter": {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "start": {"timestamp": _z(1000), "value": 200},
+            "end": {"timestamp": _z(2000), "value": 100},
+        },
+        "total_usage": 5000,
+    }
+    body = _meter_change(payload).json()
+    assert body["status"] == "ok"
+    old, new = body["segments"]
+    assert (old["min_wraps"], old["max_wraps"]) == (0, 4)
+    assert (old["min_usage"], old["max_usage"]) == (100, 4100)
+    assert (new["min_wraps"], new["max_wraps"]) == (1, 5)
+    assert (new["min_usage"], new["max_usage"]) == (900, 4900)
+
+    recon = _reconcile(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 5000,
+            "readings": [
+                {"timestamp": _z(0), "value": 100},
+                {"timestamp": _z(1000), "value": 200},
+                {"timestamp": _z(2000), "value": 100},
+            ],
+        }
+    ).json()
+    for seg, ref in zip(body["segments"], recon["segments"]):
+        assert (seg["min_wraps"], seg["max_wraps"]) == (
+            ref["min_wraps"],
+            ref["max_wraps"],
+        )
+        assert (seg["min_usage"], seg["max_usage"]) == (
+            ref["min_usage"],
+            ref["max_usage"],
+        )
+
+
+def test_meter_change_segment_conflicts_distinguished_by_meter():
+    """旧表 / 新表各自无解：以 kind=segment 与 meter 字段区分，不做总量推断。"""
+    base = {
+        "total_usage": 300,
+        "old_meter": {
+            "modulus": 1000,
+            "max_rate_per_second": 20,
+            "start": {"timestamp": _z(0), "value": 100},
+            "end": {"timestamp": _z(10), "value": 300},
+        },
+        "new_meter": {
+            "modulus": 1000,
+            "max_rate_per_second": 20,
+            "start": {"timestamp": _z(10), "value": 0},
+            "end": {"timestamp": _z(20), "value": 200},
+        },
+    }
+    # 旧表无解：100 -> 900，1s 上限 20，最小增量 800
+    payload = {
+        **base,
+        "old_meter": {**base["old_meter"], "end": {"timestamp": _z(1), "value": 900}},
+        "new_meter": {
+            **base["new_meter"],
+            "start": {"timestamp": _z(1), "value": 0},
+        },
+    }
+    body = _meter_change(payload).json()
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    assert body["modulus_gcd"] is None
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "segment"
+    assert conflict["meter"] == "old"
+    assert conflict["reason"] == "no_solution"
+    assert conflict["max_wraps"] < conflict["min_wraps"]
+
+    # 新表无解
+    payload = {
+        **base,
+        "new_meter": {
+            **base["new_meter"],
+            "end": {"timestamp": _z(11), "value": 900},
+        },
+    }
+    body = _meter_change(payload).json()
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "segment"
+    assert conflict["meter"] == "new"
+    assert conflict["reason"] == "no_solution"
+
+
+def test_meter_change_incompatible_modulus_conflict():
+    """账单总量与 gcd(M1,M2) 不同余：可区分的总量冲突原因及可行范围。"""
+    resp = _meter_change(
+        {
+            "old_meter": {
+                "modulus": 1000,
+                "max_rate_per_second": 10,
+                "start": {"timestamp": _z(0), "value": 100},
+                "end": {"timestamp": _z(10000), "value": 200},
+            },
+            "new_meter": {
+                "modulus": 300,
+                "max_rate_per_second": 10,
+                "start": {"timestamp": _z(10000), "value": 10},
+                "end": {"timestamp": _z(20000), "value": 20},
+            },
+            "total_usage": 10115,  # 读数差之和 110，应 ≡ 10 (mod 100)
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "total"
+    assert conflict["reason"] == "total_incompatible_modulus"
+    assert conflict["modulus_gcd"] == 100
+    assert conflict["expected_remainder"] == 10
+    assert conflict["feasible_min_total"] == 110
+    assert conflict["feasible_max_total"] == 199010
+
+
+def test_meter_change_out_of_range_conflict():
+    """同余但超出两段可行圈数盒：total_out_of_range，与不相容原因可区分。"""
+    resp = _meter_change(
+        {
+            "old_meter": {
+                "modulus": 1000,
+                "max_rate_per_second": 10,
+                "start": {"timestamp": _z(0), "value": 100},
+                "end": {"timestamp": _z(10000), "value": 200},
+            },
+            "new_meter": {
+                "modulus": 300,
+                "max_rate_per_second": 10,
+                "start": {"timestamp": _z(10000), "value": 10},
+                "end": {"timestamp": _z(20000), "value": 20},
+            },
+            "total_usage": 200110,  # ≡ 10 (mod 100)，但 R=200000 超出盒和
+        }
+    )
+    body = resp.json()
+    conflict = body["conflicts"][0]
+    assert conflict["reason"] == "total_out_of_range"
+    assert conflict["modulus_gcd"] == 100
+    assert conflict["expected_remainder"] is None
+    assert conflict["feasible_min_total"] == 110
+    assert conflict["feasible_max_total"] == 199010
+
+
+def test_meter_change_switch_instant_validation():
+    """旧表终读与新表初读不同刻：422；用不同时区表达同一时刻：接受。"""
+    resp = _meter_change(
+        {
+            "old_meter": {
+                "modulus": 1000,
+                "max_rate_per_second": 20,
+                "start": {"timestamp": _z(0), "value": 900},
+                "end": {"timestamp": _z(10), "value": 100},
+            },
+            "new_meter": {
+                "modulus": 1000,
+                "max_rate_per_second": 20,
+                "start": {"timestamp": _z(11), "value": 0},
+                "end": {"timestamp": _z(20), "value": 100},
+            },
+            "total_usage": 300,
+        }
+    )
+    assert resp.status_code == 422
+
+    # 同一时刻以 +08:00 / Z 两种偏移表达，归一化后相等，应通过
+    resp = _meter_change(
+        {
+            "old_meter": {
+                "modulus": 1000,
+                "max_rate_per_second": 20,
+                "start": {"timestamp": "2026-09-01T07:59:50+08:00", "value": 900},
+                "end": {"timestamp": "2026-09-01T08:00:00+08:00", "value": 100},
+            },
+            "new_meter": {
+                "modulus": 1000,
+                "max_rate_per_second": 20,
+                "start": {"timestamp": "2026-09-01T00:00:00Z", "value": 0},
+                "end": {"timestamp": "2026-09-01T00:00:10Z", "value": 100},
+            },
+            "total_usage": 300,
+        }
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_meter_change_reuses_reading_validation():
+    """新接口复用时间/读数校验：各表按各自模数校验，非法输入一律 422。"""
+    valid = {
+        "old_meter": {
+            "modulus": 1000,
+            "max_rate_per_second": 20,
+            "start": {"timestamp": _z(0), "value": 900},
+            "end": {"timestamp": _z(10), "value": 100},
+        },
+        "new_meter": {
+            "modulus": 300,
+            "max_rate_per_second": 10,
+            "start": {"timestamp": _z(10), "value": 250},
+            "end": {"timestamp": _z(20), "value": 50},
+        },
+        "total_usage": 300,
+    }
+
+    def post(**changes):
+        payload = {**valid, **{k: v for k, v in changes.items() if k in ("total_usage",)}}
+        if "old" in changes:
+            payload["old_meter"] = {**valid["old_meter"], **changes["old"]}
+        if "new" in changes:
+            payload["new_meter"] = {**valid["new_meter"], **changes["new"]}
+        if "total_usage" in changes:
+            payload["total_usage"] = changes["total_usage"]
+        return _meter_change(payload)
+
+    # 旧表读数越界（按旧表模数 1000）
+    assert post(old={"start": {"timestamp": _z(0), "value": 1000}}).status_code == 422
+    # 新表读数越界（按新表模数 300，300 在 1000 模数下合法）
+    assert post(new={"end": {"timestamp": _z(20), "value": 300}}).status_code == 422
+    # 单表内时间戳不递增
+    assert post(old={"end": {"timestamp": _z(0), "value": 100}}).status_code == 422
+    # 缺时区
+    assert post(old={"end": {"timestamp": "2026-09-01T00:00:10", "value": 100}}).status_code == 422
+    # 亚秒
+    assert post(new={"end": {"timestamp": "2026-09-01T00:00:20.5Z", "value": 50}}).status_code == 422
+    # 负速率 / 模数为 0
+    assert post(old={"max_rate_per_second": -1}).status_code == 422
+    assert post(new={"modulus": 0}).status_code == 422
+    # 账单总量负数 / 非整数
+    assert post(total_usage=-1).status_code == 422
+    assert _meter_change({**valid, "total_usage": 12.5}).status_code == 422
+
+
+def test_meter_change_core_exact_by_brute_force():
+    """随机小参数下，闭式联立结果与枚举全部 (k1, k2) 圈数组合完全一致。"""
+    rng = random.Random(20260925)
+    checked_feasible = 0
+    checked_conflict = 0
+    for _ in range(5000):
+        m1 = rng.choice([3, 5, 7, 10])
+        m2 = rng.choice([3, 4, 6, 9, 10])
+        r1, r2 = rng.randrange(m1), rng.randrange(m1)
+        r3, r4 = rng.randrange(m2), rng.randrange(m2)
+        secs1 = rng.randint(1, 15)
+        secs2 = rng.randint(1, 15)
+        rate1 = Fraction(rng.randint(0, 8), rng.randint(1, 3))
+        rate2 = Fraction(rng.randint(0, 8), rng.randint(1, 3))
+        s1 = solve_segment(0, r1, r2, secs1, m1, rate1)
+        s2 = solve_segment(1, r3, r4, secs2, m2, rate2)
+        if s1.max_wraps < s1.min_wraps or s2.max_wraps < s2.min_wraps:
+            continue  # 单段无解由端点先拦截，不属于联立函数契约
+
+        diff1, diff2 = r2 - r1, r4 - r3
+        b1, b2 = (s1.min_wraps, s1.max_wraps), (s2.min_wraps, s2.max_wraps)
+        g = math.gcd(m1, m2)
+        feas_min = diff1 + diff2 + b1[0] * m1 + b2[0] * m2
+        feas_max = diff1 + diff2 + b1[1] * m1 + b2[1] * m2
+
+        # 暴力枚举盒内全部 (k1, k2)：账单总量 -> [min_k1, max_k1, min_k2, max_k2, n]
+        totals: dict = {}
+        for k1 in range(b1[0], b1[1] + 1):
+            for k2 in range(b2[0], b2[1] + 1):
+                B = diff1 + diff2 + k1 * m1 + k2 * m2
+                if B < 0:
+                    continue
+                agg = totals.setdefault(B, [k1, k1, k2, k2, 0])
+                agg[0] = min(agg[0], k1)
+                agg[1] = max(agg[1], k1)
+                agg[2] = min(agg[2], k2)
+                agg[3] = max(agg[3], k2)
+                agg[4] += 1
+
+        # 每个可实现账单总量：闭式结果必须与枚举的逐段圈数界完全一致
+        for B, (lo1, hi1, lo2, hi2, count) in totals.items():
+            result = reconcile_meter_change(
+                (diff1, diff2), (b1, b2), (m1, m2), B
+            )
+            assert result.status == "ok"
+            assert result.modulus_gcd == g
+            n1, n2 = result.narrowed
+            assert (n1.min_wraps, n1.max_wraps) == (lo1, hi1)
+            assert (n2.min_wraps, n2.max_wraps) == (lo2, hi2)
+            assert n1.unique == n2.unique == (count == 1)
+            u1l, u1h = n1.usage_bounds(m1)
+            u2l, u2h = n2.usage_bounds(m2)
+            assert u1l == diff1 + lo1 * m1
+            assert u1h == diff1 + hi1 * m1
+            assert u2l == diff2 + lo2 * m2
+            assert u2h == diff2 + hi2 * m2
+            # 一段上界与另一段下界互补为账单总量
+            assert u1l + u2h == B
+            assert u1h + u2l == B
+            checked_feasible += 1
+
+        # 冲突样本：同余但在盒外（上下各一），以及一个不同余的值
+        candidates = []
+        low = feas_min - g
+        high = feas_max + g
+        if low >= 0:
+            candidates.append(low)
+        candidates.append(high)
+        if feas_min + 1 >= 0:
+            candidates.append(feas_min + 1)
+        for B in set(candidates):
+            if B in totals:
+                continue
+            result = reconcile_meter_change(
+                (diff1, diff2), (b1, b2), (m1, m2), B
+            )
+            assert result.status == "conflict"
+            assert (
+                result.conflicts == ("total_incompatible_modulus",)
+                if (B - diff1 - diff2) % g != 0
+                else result.conflicts == ("total_out_of_range",)
+            )
+            assert result.feasible_min_total == feas_min
+            assert result.feasible_max_total == feas_max
+            checked_conflict += 1
+
+    assert checked_feasible > 1000
+    assert checked_conflict > 500

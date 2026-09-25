@@ -30,6 +30,13 @@
         hi_i' = min(hi_i, K - Σ_j lo_j + lo_i)
 
     lo_i' == hi_i' 的段圈数唯一，可确定用量；其余段仅保留范围，不猜测。
+
+换表账单复核（reconcile_meter_change）：
+    旧表终读与新表初读同刻，两表模数 M1、M2 可不同。账单总量 B 跨两表，
+    联立条件为 k1*M1 + k2*M2 = B - (diff1 + diff2)。该二元一次不定方程
+    有整数解当且仅当 gcd(M1, M2) 整除右端；有解时由扩展欧几里得给出
+    通解，两段各自的圈数盒约束化为参数 t 的连续整数区间并直接求交，
+    同样不枚举圈数组合。t 唯一时两段用量同时确定，否则各给上下界。
 """
 
 from __future__ import annotations
@@ -219,6 +226,138 @@ def reconcile_total(
         status=STATUS_OK,
         total_wraps=total_wraps,
         narrowed=tuple(narrowed),
+        conflicts=(),
+        feasible_min_total=feasible_min_total,
+        feasible_max_total=feasible_max_total,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 换表账单复核（meter-change reconcile）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MeterChangeResult:
+    """换表账单复核结果：两段不同模数读数区间与账单总量的联立解。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    modulus_gcd: int  # 两表模数的最大公约数 g
+    # 账单总量约束后两段各自的圈数区间（旧表、新表）；冲突时为空
+    narrowed: Tuple[NarrowedSegment, ...]
+    conflicts: Tuple[str, ...]  # REASON_TOTAL_* 原因
+    feasible_min_total: int
+    feasible_max_total: int
+
+
+def _extended_gcd(a: int, b: int) -> Tuple[int, int, int]:
+    """扩展欧几里得：返回 (g, u, v)，使 u*a + v*b = g = gcd(a, b)（a, b > 0）。"""
+    old_r, r = a, b
+    old_s, s = 1, 0
+    old_t, t = 0, 1
+    while r:
+        q = old_r // r
+        old_r, r = r, old_r - q * r
+        old_s, s = s, old_s - q * s
+        old_t, t = t, old_t - q * t
+    return old_r, old_s, old_t
+
+
+def _ceil_div(n: int, d: int) -> int:
+    """n / d 向上取整（d > 0，n 可为负）。"""
+    return -((-n) // d)
+
+
+def reconcile_meter_change(
+    diffs: Tuple[int, int],
+    wrap_bounds: Tuple[Tuple[int, int], Tuple[int, int]],
+    moduli: Tuple[int, int],
+    total_usage: int,
+) -> MeterChangeResult:
+    """联立两段（旧表、新表）用量之和与跨表账单总量，模数可不同。
+
+    设两段读数差为 diff1、diff2，模数为 M1、M2，真实增量为
+    ``delta_i = diff_i + k_i * M_i``（k_i 为非负整数，且各自落在满足
+    非负增量与速率上限的区间 ``[lo_i, hi_i]`` 内，调用方需保证两段均可行）。
+    账单总量 B 要求：
+
+        k1 * M1 + k2 * M2 = B - (diff1 + diff2) =: R
+
+    这是二元一次不定方程。记 g = gcd(M1, M2)：
+
+    * R 不是 g 的倍数 -> 无整数解（total_incompatible_modulus）；
+    * 否则由扩展欧几里得得特解 (k1_0, k2_0)，通解为
+      ``k1 = k1_0 + (M2/g) * t``，``k2 = k2_0 - (M1/g) * t``（t 为整数）。
+      两段的盒约束 ``lo_i <= k_i <= hi_i`` 各自化为 t 的线性不等式，
+      交集仍是连续整数区间 [t_lo, t_hi]，**闭式求交，不枚举圈数组合**；
+    * t_lo > t_hi -> 盒内无解（total_out_of_range，含 R < 0 的情形）。
+
+    t 唯一当且仅当两段圈数同时唯一（k1、k2 均随 t 严格单调），此时两段
+    用量同时确定；否则各自给出可行用量上下界。所有可行 t 下两段用量之和
+    恒为 B，故一段的上界与另一段的下界互补（delta1_max + delta2_min = B）。
+    """
+    diff1, diff2 = diffs
+    (lo1, hi1), (lo2, hi2) = wrap_bounds
+    m1, m2 = moduli
+
+    g = math.gcd(m1, m2)
+    base = diff1 + diff2  # 两段读数差之和
+    feasible_min_total = base + lo1 * m1 + lo2 * m2
+    feasible_max_total = base + hi1 * m1 + hi2 * m2
+    remainder = total_usage - base  # R = k1*M1 + k2*M2 须等于它
+
+    def _conflict(reason: str) -> MeterChangeResult:
+        return MeterChangeResult(
+            status=STATUS_CONFLICT,
+            modulus_gcd=g,
+            narrowed=(),
+            conflicts=(reason,),
+            feasible_min_total=feasible_min_total,
+            feasible_max_total=feasible_max_total,
+        )
+
+    # 总量必须与读数差之和模 g 同余，否则不定方程无整数解
+    if remainder % g != 0:
+        return _conflict(REASON_TOTAL_INCOMPATIBLE_MODULUS)
+
+    # 贝祖特解：u*M1 + v*M2 = g，两边乘 R/g 得一组 (k1_0, k2_0)
+    _, u, v = _extended_gcd(m1, m2)
+    n = remainder // g
+    k1_0, k2_0 = u * n, v * n
+    step1, step2 = m2 // g, m1 // g  # k1 = k1_0 + step1*t；k2 = k2_0 - step2*t
+
+    # 盒约束化为 t 的双侧不等式（step1、step2 均为正）
+    t_lo = max(
+        _ceil_div(lo1 - k1_0, step1),  # lo1 <= k1_0 + step1*t
+        _ceil_div(k2_0 - hi2, step2),  # k2_0 - step2*t <= hi2
+    )
+    t_hi = min(
+        (hi1 - k1_0) // step1,  # k1_0 + step1*t <= hi1（// 即向下取整）
+        (k2_0 - lo2) // step2,  # lo2 <= k2_0 - step2*t
+    )
+
+    if t_lo > t_hi:
+        return _conflict(REASON_TOTAL_OUT_OF_RANGE)
+
+    # t 增大时 k1 增、k2 减，端点处分别取得两段各自的圈数界
+    narrowed = (
+        NarrowedSegment(
+            index=0,
+            diff=diff1,
+            min_wraps=k1_0 + step1 * t_lo,
+            max_wraps=k1_0 + step1 * t_hi,
+        ),
+        NarrowedSegment(
+            index=1,
+            diff=diff2,
+            min_wraps=k2_0 - step2 * t_hi,
+            max_wraps=k2_0 - step2 * t_lo,
+        ),
+    )
+    return MeterChangeResult(
+        status=STATUS_OK,
+        modulus_gcd=g,
+        narrowed=narrowed,
         conflicts=(),
         feasible_min_total=feasible_min_total,
         feasible_max_total=feasible_max_total,

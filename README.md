@@ -4,6 +4,8 @@
 
 此外提供**账单总量对账**接口：在同一组非负增量与速率上限约束下，额外接收账单总用量，以整数区间运算收紧各段仍可行的回绕次数范围；只有圈数被唯一确定的段才给出用量，其余段仅返回范围，冲突时给出明确原因。
 
+还提供**换表账单复核**接口：旧表终读与新表初读须为同一时刻（换表时刻），两表模数与最大速率可不同；先分别求各段满足非负增量与速率上限的回绕区间，再在模数可不同的情况下精确联立两段用量之和与跨表账单总量（扩展欧几里得闭式求解，不枚举圈数组合），返回两段可行用量上下界及唯一性，单段无解或账单冲突时给出可区分的原因。
+
 还提供**每日用量上下界**接口：将每个相邻读数区间按 UTC 午夜切成子段（每段容量为 `floor(速率 × 秒数)`），在区间总增量 `读数差 + k×模数` 可分配为各子段非负整数用量的前提下，给出覆盖时段内**每个 UTC 自然日**的最小/最大可行整数用量。
 
 ## 快速启动（Docker，一键）
@@ -17,6 +19,7 @@ docker compose up --build
 - API 地址：`http://localhost:8000`
 - 用量复核：`POST http://localhost:8000/v1/usage/verify`
 - 账单总量对账：`POST http://localhost:8000/v1/usage/reconcile`
+- 换表账单复核：`POST http://localhost:8000/v1/usage/meter-change/reconcile`
 - 每日用量上下界：`POST http://localhost:8000/v1/usage/daily-range`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/health`
@@ -240,6 +243,133 @@ pytest
 
 存在分段无解冲突时不再进行总量推断；总量冲突时 `segments` 为空。`total_usage` 为负数或非整数等请求校验错误返回 `422`。
 
+### `POST /v1/usage/meter-change/reconcile`
+
+换表账单复核。接收旧表、新表各自的起止读数、模数与最大速率，以及跨两表的账单总用量；**旧表终读与新表初读须为同一时刻**（换表时刻，用不同时区偏移表达同一瞬间亦可）。先分别求各段满足非负增量与速率上限的回绕区间，再在模数可不同的情况下精确联立两段用量之和与账单总量（扩展欧几里得闭式求解，**不枚举圈数组合**）。
+
+**请求体**
+
+```json
+{
+  "old_meter": {
+    "modulus": 1000,
+    "max_rate_per_second": 10,
+    "start": { "timestamp": "2026-09-01T00:00:00Z", "value": 100 },
+    "end": { "timestamp": "2026-09-01T02:46:40Z", "value": 200 }
+  },
+  "new_meter": {
+    "modulus": 300,
+    "max_rate_per_second": 10,
+    "start": { "timestamp": "2026-09-01T02:46:40Z", "value": 10 },
+    "end": { "timestamp": "2026-09-01T05:33:20Z", "value": 20 }
+  },
+  "total_usage": 10110
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `old_meter` / `new_meter` | 对象 | 各含 `modulus`（`>= 1`）、`max_rate_per_second`（`>= 0`，支持小数）与 `start` / `end` 两条读数；读数校验与 `/v1/usage/verify` 一致（秒精度且带时区、`0 <= value < 该表 modulus`、表内起止时间严格递增） |
+| `total_usage` | 整数 | `>= 0`，跨两表的账单总用量 |
+| 换表时刻 | — | `old_meter.end.timestamp` 必须等于 `new_meter.start.timestamp`，否则 `422` |
+
+**响应（账单可行，`200`，`status = "ok"`）**
+
+```json
+{
+  "status": "ok",
+  "total_usage": 10110,
+  "modulus_gcd": 100,
+  "segments": [
+    {
+      "meter": "old",
+      "modulus": 1000,
+      "start_timestamp": "2026-09-01T00:00:00Z",
+      "end_timestamp": "2026-09-01T02:46:40Z",
+      "start_reading": 100,
+      "end_reading": 200,
+      "elapsed_seconds": 10000,
+      "min_wraps": 1,
+      "max_wraps": 10,
+      "wraps": null,
+      "usage": null,
+      "min_usage": 1100,
+      "max_usage": 10100
+    },
+    {
+      "meter": "new",
+      "modulus": 300,
+      "start_timestamp": "2026-09-01T02:46:40Z",
+      "end_timestamp": "2026-09-01T05:33:20Z",
+      "start_reading": 10,
+      "end_reading": 20,
+      "elapsed_seconds": 10000,
+      "min_wraps": 0,
+      "max_wraps": 30,
+      "wraps": null,
+      "usage": null,
+      "min_usage": 10,
+      "max_usage": 9010
+    }
+  ],
+  "conflicts": []
+}
+```
+
+- `segments` 固定按旧表、新表顺序返回，`meter` 字段标明归属，`modulus_gcd` 为两表模数的最大公约数。
+- 圈数唯一时（两段必然同时唯一）`wraps` / `usage` 给出确定值，`min_usage` / `max_usage` 为 `null`；仍有多解时反之，**只给范围不猜测**。
+- 任意可行组合下两段用量之和恒等于 `total_usage`，故一段的上界与另一段的下界互补：`old.max_usage + new.min_usage == old.min_usage + new.max_usage == total_usage`。
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+某段原本无解时（`kind = "segment"`，`meter` 区分旧表/新表）：
+
+```json
+{
+  "status": "conflict",
+  "total_usage": 300,
+  "modulus_gcd": null,
+  "segments": [],
+  "conflicts": [
+    {
+      "kind": "segment",
+      "meter": "old",
+      "start_timestamp": "2026-09-01T00:00:00Z",
+      "end_timestamp": "2026-09-01T00:00:01Z",
+      "start_reading": 100,
+      "end_reading": 900,
+      "elapsed_seconds": 1,
+      "reason": "no_solution",
+      "detail": "无解：最可能增量 800 已超出该区间 1s 内允许的最大增量 20（k 需同时满足 k>=0 与 k<=-1，区间为空）",
+      "min_wraps": 0,
+      "max_wraps": -1
+    }
+  ]
+}
+```
+
+账单总量与两表模数不相容或超界时（`kind = "total"`）：
+
+```json
+{
+  "kind": "total",
+  "reason": "total_incompatible_modulus",
+  "detail": "账单总量与两表模数不相容：总量 B 必须满足 B ≡ 10 (mod 100)（g = gcd(1000, 300)，两段读数差之和为 110），收到 10115（余数 15），不定方程 k1×1000 + k2×300 = B - 110 无整数解",
+  "modulus_gcd": 100,
+  "feasible_min_total": 110,
+  "feasible_max_total": 199010,
+  "expected_remainder": 10
+}
+```
+
+冲突原因（三类可区分）：
+
+- `kind = "segment"`，`reason = "no_solution"`：旧表或新表单段在非负增量/速率上限下原本无解（`meter` 指明是哪只表），此时不做总量推断。
+- `kind = "total"`，`reason = "total_incompatible_modulus"`：账单总量与两段读数差之和模 `g = gcd(M1, M2)` 不同余，不定方程无整数解；`expected_remainder` 给出应有的模 `g` 余数。
+- `kind = "total"`，`reason = "total_out_of_range"`：同余但两段圈数盒内无可行组合，即可行账单总量不在 `[feasible_min_total, feasible_max_total]` 内（该区间内仍须满足模 `g` 同余）。
+
+存在分段无解冲突时不再进行总量推断；总量冲突时 `segments` 为空。换表时刻不一致、读数越界（按各自模数）、时间戳不递增/缺时区/亚秒、`total_usage` 为负数或非整数等请求校验错误返回 `422`。
+
 ### `POST /v1/usage/daily-range`
 
 按 UTC 自然日给出每日最小/最大可行整数用量。请求体与 `/v1/usage/verify` 完全相同（读数、模数、最大每秒速率的校验一致，无额外字段）。
@@ -350,6 +480,22 @@ hi_i' = min(k_max_i, K - Σ_{j≠i} k_min_j)
 
 `lo_i' == hi_i'` 的段圈数唯一、确定用量；其余段返回 `[lo_i', hi_i']` 及对应用量范围，不做猜测。
 
+### 换表账单复核
+
+旧表段 `(diff1, M1)`、新表段 `(diff2, M2)` 各自先求得满足非负增量与速率上限的圈数区间 `[lo_i, hi_i]`（同单段判定规则）。账单总量 `B` 跨两表，联立条件为二元一次不定方程：
+
+```
+k1 * M1 + k2 * M2 = B - (diff1 + diff2) =: R
+```
+
+记 `g = gcd(M1, M2)`：
+
+1. `R` 不是 `g` 的倍数 → 无整数解（`total_incompatible_modulus`）；模数相同时退化为既有对账接口的同余检查；
+2. 否则由扩展欧几里得得特解 `(k1_0, k2_0)`，通解为 `k1 = k1_0 + (M2/g)·t`，`k2 = k2_0 - (M1/g)·t`（`t` 为整数）。两段的盒约束 `lo_i <= k_i <= hi_i` 各自化为 `t` 的线性不等式，交集仍是连续整数区间 `[t_lo, t_hi]`，**闭式求交，不枚举圈数组合**；
+3. `t_lo > t_hi` → 盒内无可行组合（`total_out_of_range`，可行总量区间 `[diff1+diff2+lo1·M1+lo2·M2, diff1+diff2+hi1·M1+hi2·M2]` 随之给出）。
+
+`t` 唯一当且仅当两段圈数**同时**唯一（`k1`、`k2` 均随 `t` 严格单调），此时两段用量同时确定；否则各给用量上下界。所有可行 `t` 下两段用量之和恒为 `B`，故一段的上界与另一段的下界互补：`delta1_max + delta2_min = delta1_min + delta2_max = B`。
+
 ### 每日用量上下界
 
 对读数区间 `(r1, t1) -> (r2, t2)`，按 UTC 午夜切成子段，第 `j` 子段时长 `s_j` 秒、容量
@@ -387,7 +533,7 @@ x_j 上界 = min(c_j,    (r2-r1) + k_max×M)
 ```
 app/
   main.py   # FastAPI 应用、请求/响应模型与校验
-  core.py   # 回绕次数判定、总量对账与跨日子段界（Fraction 精确计算）
+  core.py   # 回绕次数判定、总量对账、换表联立与跨日子段界（Fraction 精确计算）
 tests/
   test_api.py
 Dockerfile
