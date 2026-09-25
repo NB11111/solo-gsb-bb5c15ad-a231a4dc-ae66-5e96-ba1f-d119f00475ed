@@ -1,0 +1,8 @@
+services:
+  usage-verifier:
+    build: .
+    image: water-meter-usage-verifier:latest
+    container_name: usage-verifier
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
