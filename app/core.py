@@ -30,6 +30,21 @@
         hi_i' = min(hi_i, K - Σ_j lo_j + lo_i)
 
     lo_i' == hi_i' 的段圈数唯一，可确定用量；其余段仅保留范围，不猜测。
+
+换表账单复核（reconcile_meter_total）：
+    旧表、新表两段模数 M1、M2 可不同。两段用量分别为
+        u1 = d1 + k1*M1, u2 = d2 + k2*M2
+    （d 为段内首尾读数差），账单总量 B 要求 u1 + u2 = B，即
+        M1*k1 + M2*k2 = N，N = B - d1 - d2
+    该二元一次丢番图方程有整数解当且仅当 g = gcd(M1, M2) 整除 N
+    （total_incompatible_modulus）。有解时由扩展欧几里得取特解
+    (k10, k20)，全部整数解为单参数族：
+        k1 = k10 + (M2/g)*t, k2 = k20 - (M1/g)*t   （t 为任意整数）
+    两段各自的可行圈数区间 [lo_i, hi_i] 把 t 夹到连续整数区间
+    [t_min, t_max]（四个 ceil/floor 不等式取交）；t_min > t_max 即账单
+    超界（total_out_of_range）。全程仅整数区间运算，不枚举圈数组合。
+    t_min == t_max 时两段圈数同时唯一；否则按等差数列端点给出各段用量
+    上下界（每个可行 t 均严格满足 u1 + u2 = B）。
 """
 
 from __future__ import annotations
@@ -358,4 +373,179 @@ def solve_daily_segment(
         subsegments=subsegments,
         min_usages=tuple(min_usages),
         max_usages=tuple(max_usages),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 换表账单复核（meter-change）：跨两表、模数可不同
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MeterSegmentNarrowed:
+    """换表账单总量约束后，一段（旧表或新表）仍可行的圈数区间。"""
+
+    meter: str  # "old" 或 "new"
+    diff: int
+    modulus: int
+    min_wraps: int
+    max_wraps: int
+    wraps_step: int  # 可行圈数序列的公差（恒正）
+
+    @property
+    def unique(self) -> bool:
+        """该段圈数是否已被账单总量唯一确定。"""
+        return self.min_wraps == self.max_wraps
+
+    @property
+    def wraps(self) -> Optional[int]:
+        return self.min_wraps if self.unique else None
+
+    def usage_bounds(self) -> Tuple[int, int]:
+        """该段用量的最小/最大可能值（端点均可达到）。"""
+        return (
+            self.diff + self.min_wraps * self.modulus,
+            self.diff + self.max_wraps * self.modulus,
+        )
+
+
+@dataclass(frozen=True)
+class MeterReconcileResult:
+    """跨两表账单总量对账结果。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    conflicts: Tuple[str, ...]  # REASON_TOTAL_* 原因
+    gcd: int  # gcd(旧表模数, 新表模数)
+    old_segment: Optional[MeterSegmentNarrowed]
+    new_segment: Optional[MeterSegmentNarrowed]
+    feasible_min_total: int
+    feasible_max_total: int
+
+
+def _extended_gcd(a: int, b: int) -> Tuple[int, int, int]:
+    """扩展欧几里得算法：返回 ``(g, x, y)`` 使 ``a*x + b*y = g = gcd(a, b)``。"""
+    if b == 0:
+        return a, 1, 0
+    g, x1, y1 = _extended_gcd(b, a % b)
+    return g, y1, x1 - (a // b) * y1
+
+
+def _ceil_div(a: int, b: int) -> int:
+    """b > 0 时的精确 ceil(a / b)，a 可为负（不依赖浮点）。"""
+    return -((-a) // b)
+
+
+def reconcile_meter_total(
+    old_diff: int,
+    old_bounds: Tuple[int, int],
+    old_modulus: int,
+    new_diff: int,
+    new_bounds: Tuple[int, int],
+    new_modulus: int,
+    total_usage: int,
+) -> MeterReconcileResult:
+    """以跨两表的账单总用量精确联立两段回绕次数，模数可不同，不枚举圈数组合。
+
+    旧表段用量 ``u1 = d1 + k1*M1``，新表段用量 ``u2 = d2 + k2*M2``
+    （``d`` 为段内读数差，``k`` 为非负整圈数）。账单要求：
+
+        u1 + u2 = B
+        => M1*k1 + M2*k2 = N，其中 N = B - d1 - d2
+
+    该线性丢番图方程：
+
+    1. 有整数解当且仅当 ``g = gcd(M1, M2)`` 整除 ``N``；否则账单与两表
+       模数不相容（``total_incompatible_modulus``）；
+    2. 有整数解时，由扩展欧几里得给出一组特解 ``(k10, k20)``，全部解为
+       单参数整数族 ``k1 = k10 + p*t``、``k2 = k20 - q*t``
+       （``p = M2/g``，``q = M1/g``）。两段各自的圈数区间
+       ``[lo, hi]`` 把 ``t`` 夹到一个连续整数区间 ``[t_min, t_max]``：
+
+           t >= ceil((lo1 - k10) / p)，t <= floor((hi1 - k10) / p)
+           t >= ceil((k20 - hi2) / q)，t <= floor((k20 - lo2) / q)
+
+       ``t_min > t_max`` 即账单总量超界（``total_out_of_range``）。
+    3. ``t_min == t_max`` 时两段圈数同时唯一；否则各段可行圈数仍为
+       等差数列（公差分别为 ``p``、``q``），据端点给出精确用量上下界，
+       不猜测。注意每一个可行 ``t`` 都严格满足 ``u1 + u2 == B``。
+
+    :param old_bounds/new_bounds: 各段在非负增量与速率上限下的可行圈数
+        区间 ``(k_min, k_max)``，调用方需保证每段均可行
+    """
+    lo1, hi1 = old_bounds
+    lo2, hi2 = new_bounds
+
+    feasible_min_total = (
+        old_diff + lo1 * old_modulus + new_diff + lo2 * new_modulus
+    )
+    feasible_max_total = (
+        old_diff + hi1 * old_modulus + new_diff + hi2 * new_modulus
+    )
+
+    g, c1, c2 = _extended_gcd(old_modulus, new_modulus)
+    numerator = total_usage - old_diff - new_diff
+
+    if numerator % g != 0:
+        return MeterReconcileResult(
+            status=STATUS_CONFLICT,
+            conflicts=(REASON_TOTAL_INCOMPATIBLE_MODULUS,),
+            gcd=g,
+            old_segment=None,
+            new_segment=None,
+            feasible_min_total=feasible_min_total,
+            feasible_max_total=feasible_max_total,
+        )
+
+    # 特解：M1*k10 + M2*k20 = numerator
+    n = numerator // g
+    k10 = n * c1
+    k20 = n * c2
+    p = new_modulus // g  # k1 随 t 的步长
+    q = old_modulus // g  # k2 随 t 的步长（方向相反）
+
+    # k1 = k10 + p*t ∈ [lo1, hi1]
+    t_lo = _ceil_div(lo1 - k10, p)
+    t_hi = (hi1 - k10) // p
+    # k2 = k20 - q*t ∈ [lo2, hi2]
+    t_lo = max(t_lo, _ceil_div(k20 - hi2, q))
+    t_hi = min(t_hi, (k20 - lo2) // q)
+
+    if t_lo > t_hi:
+        return MeterReconcileResult(
+            status=STATUS_CONFLICT,
+            conflicts=(REASON_TOTAL_OUT_OF_RANGE,),
+            gcd=g,
+            old_segment=None,
+            new_segment=None,
+            feasible_min_total=feasible_min_total,
+            feasible_max_total=feasible_max_total,
+        )
+
+    k1_min = k10 + p * t_lo
+    k1_max = k10 + p * t_hi
+    k2_min = k20 - q * t_hi  # k2 随 t 递减：最小在 t_hi
+    k2_max = k20 - q * t_lo
+
+    return MeterReconcileResult(
+        status=STATUS_OK,
+        conflicts=(),
+        gcd=g,
+        old_segment=MeterSegmentNarrowed(
+            meter="old",
+            diff=old_diff,
+            modulus=old_modulus,
+            min_wraps=k1_min,
+            max_wraps=k1_max,
+            wraps_step=p,
+        ),
+        new_segment=MeterSegmentNarrowed(
+            meter="new",
+            diff=new_diff,
+            modulus=new_modulus,
+            min_wraps=k2_min,
+            max_wraps=k2_max,
+            wraps_step=q,
+        ),
+        feasible_min_total=feasible_min_total,
+        feasible_max_total=feasible_max_total,
     )

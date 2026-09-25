@@ -8,7 +8,7 @@ from fractions import Fraction
 
 from fastapi.testclient import TestClient
 
-from app.core import solve_daily_segment
+from app.core import reconcile_meter_total, solve_daily_segment
 from app.main import app
 
 client = TestClient(app)
@@ -24,6 +24,10 @@ def _reconcile(payload):
 
 def _daily_range(payload):
     return _post(payload, path="/v1/usage/daily-range")
+
+
+def _meter_change(payload):
+    return _post(payload, path="/v1/usage/meter-change/reconcile")
 
 
 # ---------------------------------------------------------------------------
@@ -858,3 +862,319 @@ def test_daily_segment_bounds_exact_by_brute_force():
             assert list(result.min_usages) == lows
             assert list(result.max_usages) == highs
     assert checked > 200  # 确认确实跑了足够多的用例
+
+
+# ---------------------------------------------------------------------------
+# 换表账单复核 /v1/usage/meter-change/reconcile
+# ---------------------------------------------------------------------------
+
+def _meter_payload(total_usage, old_mod=1000, new_mod=1500, rate=10, secs=1000,
+                   old_values=(900, 50), new_values=(1200, 300),
+                   junction="2026-09-24T00:16:40Z",
+                   old_start="2026-09-24T00:00:00Z",
+                   new_end="2026-09-24T00:33:20Z"):
+    return {
+        "total_usage": total_usage,
+        "old_meter": {
+            "modulus": old_mod,
+            "max_rate_per_second": rate,
+            "start": {"timestamp": old_start, "value": old_values[0]},
+            "end": {"timestamp": junction, "value": old_values[1]},
+        },
+        "new_meter": {
+            "modulus": new_mod,
+            "max_rate_per_second": rate,
+            "start": {"timestamp": junction, "value": new_values[0]},
+            "end": {"timestamp": new_end, "value": new_values[1]},
+        },
+    }
+
+
+def test_meter_change_unique_both_segments():
+    """B=2250：旧表 1 圈(150)、新表 2 圈(2100)，两段同时唯一。"""
+    resp = _meter_change(_meter_payload(2250))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["unique"] is True
+    assert body["conflicts"] == []
+    old, new = body["segments"]
+    assert old["meter"] == "old" and new["meter"] == "new"
+    assert (old["wraps"], old["usage"]) == (1, 150)
+    assert (new["wraps"], new["usage"]) == (2, 2100)
+    assert old["min_usage"] is None and old["max_usage"] is None
+    assert new["min_usage"] is None and new["max_usage"] is None
+    assert old["elapsed_seconds"] == 1000
+    assert old["modulus"] == 1000 and new["modulus"] == 1500
+
+
+def test_meter_change_ambiguous_ranges_sum_to_bill():
+    """B=4750：两表模数不同（1000/1500，gcd=500），各段仍有多解。
+
+    旧表可行圈数 1..7（步长 3），用量 [150,6150]∩账单 -> [1150,4150]；
+    新表可行圈数 1..3（步长 2），用量 [600,3600]；任一可行组合两段
+    用量之和恒为 4750。
+    """
+    resp = _meter_change(_meter_payload(4750))
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["unique"] is False
+    old, new = body["segments"]
+    assert old["wraps"] is None and old["usage"] is None
+    assert new["wraps"] is None and new["usage"] is None
+    assert (old["min_usage"], old["max_usage"]) == (1150, 4150)
+    assert (new["min_usage"], new["max_usage"]) == (600, 3600)
+    assert (old["min_wraps"], old["max_wraps"], old["wraps_step"]) == (2, 5, 3)
+    assert (new["min_wraps"], new["max_wraps"], new["wraps_step"]) == (1, 3, 2)
+    # 端点组合严格对账
+    assert old["min_usage"] + new["max_usage"] == 4750
+    assert old["max_usage"] + new["min_usage"] == 4750
+
+
+def test_meter_change_equal_moduli_matches_single_modulus():
+    """两表模数相同时，与统一模数的总量对账同余规则一致。"""
+    resp = _meter_change(
+        _meter_payload(2250, old_mod=1000, new_mod=1000, new_values=(200, 300))
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    old, new = body["segments"]
+    # 旧 d=-850、新 d=100，B=2250 => k1+k2=3；边界内多解
+    assert (old["min_usage"], old["max_usage"]) == (150, 2150)
+    assert (new["min_usage"], new["max_usage"]) == (100, 2100)
+    assert old["min_usage"] + new["max_usage"] == 2250
+
+
+def test_meter_change_incompatible_modulus():
+    """B 不被 gcd(1000,1500)=500 整除：total_incompatible_modulus。"""
+    resp = _meter_change(_meter_payload(4751))
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "total"
+    assert conflict["reason"] == "total_incompatible_modulus"
+    assert conflict["modulus_gcd"] == 500
+    assert conflict["old_modulus"] == 1000
+    assert conflict["new_modulus"] == 1500
+    # d_old + d_new = -850 - 900 = -1750 ≡ 250 (mod 500)
+    assert conflict["expected_remainder"] == 250
+    assert conflict["feasible_min_total"] == 750
+    assert conflict["feasible_max_total"] == 18750
+
+
+def test_meter_change_out_of_range_above_box():
+    """B 与 gcd 相容但远超可行区间：total_out_of_range。
+
+    相容值须 B ≡ d1+d2 = -1750 ≡ 250 (mod 500)；19250 相容但大于
+    可行上界 18750。
+    """
+    resp = _meter_change(_meter_payload(19250))
+    body = resp.json()
+    conflict = body["conflicts"][0]
+    assert body["status"] == "conflict"
+    assert conflict["kind"] == "total"
+    assert conflict["reason"] == "total_out_of_range"
+    assert (conflict["feasible_min_total"], conflict["feasible_max_total"]) == (
+        750,
+        18750,
+    )
+    assert conflict["expected_remainder"] is None
+
+
+def test_meter_change_in_box_but_no_integer_pair():
+    """B=1250 落在 [750,18750] 内且被 500 整除，但联立无整数组合。
+
+    方程 1000k1 + 1500k2 = 3000 即 2k1+3k2=6，解族 k1∈{0,3}（k2={2,0}），
+    两段均要求 k>=1，故全部落在可行区间之外。
+    """
+    resp = _meter_change(_meter_payload(1250))
+    body = resp.json()
+    conflict = body["conflicts"][0]
+    assert conflict["reason"] == "total_out_of_range"
+    # detail 需明确指出"数值在区间内但无整数组合"这一可区分情形
+    assert "落在上述区间内" in conflict["detail"]
+
+
+def test_meter_change_old_segment_no_solution():
+    """旧表段本身超过速率上限：分段冲突，不做总量联立。"""
+    payload = _meter_payload(2250, rate=10, secs=1)
+    payload["old_meter"]["end"] = {
+        "timestamp": "2026-09-24T00:00:01Z",
+        "value": 50,
+    }
+    payload["new_meter"]["start"] = {
+        "timestamp": "2026-09-24T00:00:01Z",
+        "value": 1200,
+    }
+    payload["new_meter"]["end"] = {
+        "timestamp": "2026-09-24T00:16:41Z",
+        "value": 300,
+    }
+    resp = _meter_change(payload)
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "segment"
+    assert conflict["meter"] == "old"
+    assert conflict["reason"] == "no_solution"
+    assert conflict["max_wraps"] < conflict["min_wraps"]
+
+
+def test_meter_change_both_segments_no_solution_listed():
+    """两段都无解时一并列出。"""
+    payload = _meter_payload(2250, rate=1, secs=1)
+    payload["old_meter"]["end"] = {
+        "timestamp": "2026-09-24T00:00:01Z",
+        "value": 50,
+    }
+    payload["new_meter"]["start"] = {
+        "timestamp": "2026-09-24T00:00:01Z",
+        "value": 1200,
+    }
+    payload["new_meter"]["end"] = {
+        "timestamp": "2026-09-24T00:00:02Z",
+        "value": 300,
+    }
+    resp = _meter_change(payload)
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert [c["meter"] for c in body["conflicts"]] == ["old", "new"]
+    assert all(c["reason"] == "no_solution" for c in body["conflicts"])
+
+
+def test_meter_change_junction_must_be_same_instant():
+    """旧表终读与新表初读不同刻：422。"""
+    payload = _meter_payload(2250)
+    payload["new_meter"]["start"]["timestamp"] = "2026-09-24T00:16:41Z"
+    resp = _meter_change(payload)
+    assert resp.status_code == 422
+
+
+def test_meter_change_timezone_junction_normalized():
+    """交界刻以不同时区表达但同一时刻：换算 UTC 后通过，结果不受影响。"""
+    payload = _meter_payload(2250)
+    # 2026-09-24T08:16:40+08:00 == 2026-09-24T00:16:40Z
+    payload["old_meter"]["end"]["timestamp"] = "2026-09-24T08:16:40+08:00"
+    resp = _meter_change(payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_meter_change_reuses_reading_validation():
+    """复用现有校验：读数越界、时间不递增、缺时区、亚秒、负速率均 422。"""
+    base = _meter_payload(2250)
+
+    def expect_422(mut):
+        import copy
+
+        payload = copy.deepcopy(base)
+        mut(payload)
+        assert _meter_change(payload).status_code == 422
+
+    # 旧表读数越界
+    expect_422(lambda p: p["old_meter"]["start"].update(value=1000))
+    # 新表读数越界（M=1500）
+    expect_422(lambda p: p["new_meter"]["end"].update(value=1500))
+    # 旧表内部时间不递增
+    expect_422(
+        lambda p: p["old_meter"]["start"].update(
+            timestamp="2026-09-24T00:16:40Z"
+        )
+    )
+    # 缺时区
+    expect_422(
+        lambda p: p["old_meter"]["start"].update(
+            timestamp="2026-09-24T00:00:00"
+        )
+    )
+    # 亚秒
+    expect_422(
+        lambda p: p["old_meter"]["start"].update(
+            timestamp="2026-09-24T00:00:00.5Z"
+        )
+    )
+    # 负速率（各自表独立校验）
+    expect_422(lambda p: p["new_meter"].update(max_rate_per_second=-1))
+    # 模数 < 1
+    expect_422(lambda p: p["old_meter"].update(modulus=0))
+    # 账单总量为负
+    expect_422(lambda p: p.update(total_usage=-1))
+
+
+# ---------------------------------------------------------------------------
+# reconcile_meter_total 精确性：与全枚举暴力结果比对（固定随机种子）
+# ---------------------------------------------------------------------------
+
+def test_reconcile_meter_total_exact_by_brute_force():
+    """随机小参数下，丢番图通解区间与枚举全部 (k1,k2) 的结果一致。"""
+    rng = random.Random(20260925)
+    checked = 0
+    for _ in range(4000):
+        m1 = rng.choice([2, 3, 4, 5, 6, 7])
+        m2 = rng.choice([2, 3, 4, 5, 6, 7, 9])
+        d1 = rng.randrange(m1) - rng.randrange(m1)
+        d2 = rng.randrange(m2) - rng.randrange(m2)
+        lo1 = 0 if d1 >= 0 else math.ceil(-d1 / m1)
+        lo2 = 0 if d2 >= 0 else math.ceil(-d2 / m2)
+        hi1 = lo1 + rng.randint(0, 5)
+        hi2 = lo2 + rng.randint(0, 5)
+
+        feasible_B = sorted(
+            {
+                d1 + k1 * m1 + d2 + k2 * m2
+                for k1 in range(lo1, hi1 + 1)
+                for k2 in range(lo2, hi2 + 1)
+            }
+        )
+        # 抽测可行 B（含全部最小/最大值）与若干不可行 B
+        targets = set(feasible_B)
+        for _ in range(3):
+            if feasible_B:
+                base_b = rng.choice(feasible_B)
+                targets.add(base_b + rng.choice([-3, -2, -1, 1, 2, 3]))
+        targets.update(
+            [feasible_B[0] - 1, feasible_B[-1] + 1] if feasible_B else [d1 + d2]
+        )
+
+        for B in targets:
+            r = reconcile_meter_total(
+                d1, (lo1, hi1), m1, d2, (lo2, hi2), m2, B
+            )
+            pairs = [
+                (k1, k2)
+                for k1 in range(lo1, hi1 + 1)
+                for k2 in range(lo2, hi2 + 1)
+                if d1 + k1 * m1 + d2 + k2 * m2 == B
+            ]
+            if pairs:
+                checked += 1
+                assert r.status == "ok", (m1, m2, d1, d2, B, r.conflicts)
+                k1s = sorted({p[0] for p in pairs})
+                k2s = sorted({p[1] for p in pairs})
+                os_, ns = r.old_segment, r.new_segment
+                assert (os_.min_wraps, os_.max_wraps) == (k1s[0], k1s[-1])
+                assert (ns.min_wraps, ns.max_wraps) == (k2s[0], k2s[-1])
+                assert os_.unique == ns.unique == (len(pairs) == 1)
+                if len(k1s) > 1:
+                    assert os_.wraps_step == k1s[1] - k1s[0]
+                    assert ns.wraps_step == k2s[1] - k2s[0]
+                # 每个端点都严格对账
+                assert (
+                    d1 + os_.min_wraps * m1 + d2 + ns.max_wraps * m2 == B
+                )
+                assert (
+                    d1 + os_.max_wraps * m1 + d2 + ns.min_wraps * m2 == B
+                )
+            else:
+                g = math.gcd(m1, m2)
+                expect = (
+                    "total_incompatible_modulus"
+                    if (B - d1 - d2) % g != 0
+                    else "total_out_of_range"
+                )
+                assert r.status == "conflict"
+                assert r.conflicts == (expect,), (m1, m2, d1, d2, B)
+                assert r.old_segment is None and r.new_segment is None
+    assert checked > 500
